@@ -1,7 +1,13 @@
-ultralytics>=8.0.0
 opencv-python>=4.5.0
 numpy>=1.21.0
 PyQt5>=5.15.0
 scipy>=1.7.0
 torch>=1.9.0
-torchvision>=0.10.0 
+torchvision>=0.10.0
+matplotlib
+tqdm
+pyyaml
+thop
+requests
+psutil
+einops
