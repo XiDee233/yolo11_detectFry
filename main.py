@@ -6,6 +6,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QPushButton, QLabel, QFileDialog, QComboBox, QGroupBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QMutex, QWaitCondition, QMutexLocker
 from PyQt5.QtGui import QImage, QPixmap
+from tracker import ObjectTracker
+import random
 
 
 class DetectionWorker(QObject):
@@ -25,6 +27,10 @@ class DetectionWorker(QObject):
         self.restart = False
         self.abort = False
         self.currently_processing = False
+        self.tracker = ObjectTracker(max_lost=4)
+        self.id_colors = {}
+        self.show_inactive = True
+        self.paused = False
 
     def set_source(self, source_type, file_path=None):
         with QMutexLocker(self.mutex):
@@ -41,103 +47,152 @@ class DetectionWorker(QObject):
             self.condition.wakeOne()
             self.status_changed.emit("已停止")
 
+    def pause(self):
+        with QMutexLocker(self.mutex):
+            self.paused = True
+            self.status_changed.emit("已暂停")
+
+    def resume(self):
+        with QMutexLocker(self.mutex):
+            self.paused = False
+            self.condition.wakeOne()
+            self.status_changed.emit("已恢复")
+
     def run(self):
         self.status_changed.emit("就绪")
-
+        cap = None
         while self.running:
-            # Wait for new task
             with QMutexLocker(self.mutex):
+                if self.paused:
+                    self.status_changed.emit("已暂停，等待恢复...")
+                    self.condition.wait(self.mutex)
                 if not self.restart and not self.abort:
                     self.status_changed.emit("等待输入...")
                     self.condition.wait(self.mutex)
-
                 if self.abort:
                     self.abort = False
                     self.restart = False
+                    if cap is not None:
+                        cap.release()
+                        cap = None
                     continue
-
-                self.restart = False
+                if self.restart:
+                    if cap is not None:
+                        cap.release()
+                        cap = None
                 self.currently_processing = True
+                self.restart = False
 
-            # Process the current task
             try:
-                cap = None
                 self.status_changed.emit(f"开始检测: {self.source_type}")
-
                 if self.source_type == "camera":
-                    cap = cv2.VideoCapture(0)
-                    if not cap.isOpened():
-                        self.error_occurred.emit("无法打开摄像头")
-                        continue
-
-                    while self.currently_processing:
+                    if cap is None:
+                        cap = cv2.VideoCapture(0)
+                        if not cap.isOpened():
+                            self.error_occurred.emit("无法打开摄像头")
+                            continue
+                    while self.currently_processing and self.running:
                         with QMutexLocker(self.mutex):
-                            if self.abort:
-                                self.status_changed.emit("摄像头检测已停止")
+                            if self.paused:
+                                self.status_changed.emit("已暂停，等待恢复...")
+                                self.condition.wait(self.mutex)
+                            if self.abort or self.restart:
                                 break
-
                         ret, frame = cap.read()
                         if not ret:
                             self.error_occurred.emit("摄像头读取失败")
                             break
-
-                        # Process frame
                         self.process_frame(frame)
-
                 elif self.source_type == "video":
                     if not self.file_path:
                         continue
-
-                    cap = cv2.VideoCapture(self.file_path)
-                    if not cap.isOpened():
-                        self.error_occurred.emit("无法打开视频文件")
-                        continue
-
-                    while self.currently_processing:
+                    if cap is None:
+                        cap = cv2.VideoCapture(self.file_path)
+                        if not cap.isOpened():
+                            self.error_occurred.emit("无法打开视频文件")
+                            continue
+                    while self.currently_processing and self.running:
                         with QMutexLocker(self.mutex):
-                            if self.abort:
-                                self.status_changed.emit("视频检测已停止")
+                            if self.paused:
+                                self.status_changed.emit("已暂停，等待恢复...")
+                                self.condition.wait(self.mutex)
+                            if self.abort or self.restart:
                                 break
-
                         ret, frame = cap.read()
                         if not ret:
                             self.status_changed.emit("视频播放完成")
                             break
-
-                        # Process frame
                         self.process_frame(frame)
-
                 elif self.source_type == "image":
                     if not self.file_path:
                         continue
-
                     frame = cv2.imread(self.file_path)
                     if frame is None:
                         self.error_occurred.emit("无法读取图片文件")
                     else:
-                        # Process image
                         self.process_frame(frame)
                         self.status_changed.emit("图片检测完成")
-
             except Exception as e:
                 self.error_occurred.emit(f"处理错误: {str(e)}")
             finally:
                 self.currently_processing = False
-                if cap is not None:
-                    cap.release()
-                    cap = None
-
+        if cap is not None:
+            cap.release()
+            cap = None
         self.finished.emit()
 
+    def get_color(self, track_id):
+        if track_id not in self.id_colors:
+            random.seed(track_id)
+            self.id_colors[track_id] = (
+                random.randint(0, 255),
+                random.randint(0, 255),
+                random.randint(0, 255)
+            )
+        return self.id_colors[track_id]
+
     def process_frame(self, frame):
+        if self.paused:
+            return
         # Use YOLO model for detection
-        results = self.model.predict(frame)
-        annotated_frame = results[0].plot()
-
-        # Convert to RGB
+        results = self.model.predict(frame, conf=0.5, iou=0.7)
+        boxes = results[0].boxes
+        dets = []
+        if boxes is not None and len(boxes) > 0:
+            for box in boxes:
+                conf = float(box.conf[0]) if hasattr(box, 'conf') else 0
+                if conf < 0.5:
+                    continue
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                cls = int(box.cls[0]) if hasattr(box, 'cls') else 0
+                dets.append([x1, y1, x2, y2, conf, cls])
+        # 更新tracker
+        tracks = self.tracker.update(dets, frame_shape=frame.shape)
+        # 绘制检测框和轨迹（每个id唯一颜色）
+        annotated_frame = frame.copy()
+        for i, track in enumerate(tracks):
+            # 判断活跃性
+            trk_obj = self.tracker.trackers[i] if i < len(self.tracker.trackers) else None
+            is_active = (trk_obj.lost == 0) if trk_obj else True
+            if self.show_inactive or is_active:
+                x1, y1, x2, y2 = map(int, track['bbox'])
+                color = self.get_color(track['id'])
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(annotated_frame, f"ID:{track['id']}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        # 画轨迹（每个id唯一颜色）
+        for i, track in enumerate(tracks):
+            trk_obj = self.tracker.trackers[i] if i < len(self.tracker.trackers) else None
+            is_active = (trk_obj.lost == 0) if trk_obj else True
+            if self.show_inactive or is_active:
+                color = self.get_color(track['id'])
+                trace = track['trace']
+                if len(trace) > 1:
+                    for j in range(1, len(trace)):
+                        pt1 = (int(trace[j-1][0]), int(trace[j-1][1]))
+                        pt2 = (int(trace[j][0]), int(trace[j][1]))
+                        cv2.line(annotated_frame, pt1, pt2, color, 2)
+        # 转为RGB
         rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-
-        # Emit the result
         self.image_ready.emit(rgb_image)
 
 
@@ -168,6 +223,10 @@ class YOLODetectionApp(QMainWindow):
         # 启动线程
         self.thread.start()
 
+        self.pause_btn = QPushButton("暂停")
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.is_paused = False
+
         self.init_ui()
 
     def init_ui(self):
@@ -190,6 +249,9 @@ class YOLODetectionApp(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_detection)
 
+        self.pause_btn = QPushButton("暂停")
+        self.pause_btn.clicked.connect(self.toggle_pause)
+
         self.status_label = QLabel("就绪")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setMinimumWidth(300)
@@ -199,6 +261,7 @@ class YOLODetectionApp(QMainWindow):
         control_layout.addWidget(self.source_combo)
         control_layout.addWidget(self.start_btn)
         control_layout.addWidget(self.stop_btn)
+        control_layout.addWidget(self.pause_btn)
         control_layout.addWidget(self.status_label)
         control_layout.addStretch()
         control_group.setLayout(control_layout)
@@ -305,6 +368,16 @@ class YOLODetectionApp(QMainWindow):
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
         else:
             self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+
+    def toggle_pause(self):
+        if not self.is_paused:
+            self.worker.pause()
+            self.pause_btn.setText("恢复")
+            self.is_paused = True
+        else:
+            self.worker.resume()
+            self.pause_btn.setText("暂停")
+            self.is_paused = False
 
     def closeEvent(self, event):
         """关闭窗口时清理资源"""
