@@ -1,13 +1,26 @@
+# 在文件顶部导入日志模块
 import sys
 import cv2
 import numpy as np
+import logging  # 添加日志模块
 from ultralytics import YOLO
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QLabel, QFileDialog, QComboBox, QGroupBox)
+                             QPushButton, QLabel, QFileDialog, QComboBox, QGroupBox, QSlider)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QMutex, QWaitCondition, QMutexLocker
 from PyQt5.QtGui import QImage, QPixmap
 from tracker import ObjectTracker
 import random
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("detection_app.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("YOLODetection")
 
 
 class DetectionWorker(QObject):
@@ -16,6 +29,9 @@ class DetectionWorker(QObject):
     error_occurred = pyqtSignal(str)
     status_changed = pyqtSignal(str)
 
+    # 在DetectionWorker类中添加一个新属性来跟踪当前检测到的ID总数
+
+    # 在DetectionWorker类的__init__方法中添加新的计数器属性
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -31,6 +47,46 @@ class DetectionWorker(QObject):
         self.id_colors = {}
         self.show_inactive = True
         self.paused = False
+        
+        # 计数线相关属性
+        self.counting_line = None  # 将在第一帧初始化
+        self.line_position = 0.5  # 默认在画面中间
+        self.line_direction = 'horizontal'  # 水平线
+        self.crossed_ids = set()  # 已经穿过线的ID集合
+        self.counter = 0  # 计数器
+        self.total_ids = set()  # 跟踪所有出现过的ID
+        
+        # 添加双向计数属性
+        self.left_to_right_counter = 0  # 从左到右计数
+        self.right_to_left_counter = 0  # 从右到左计数
+        self.top_to_bottom_counter = 0  # 从上到下计数
+        self.bottom_to_top_counter = 0  # 从下到上计数
+        self.crossed_direction = {}  # 记录每个ID穿过的方向
+
+    def set_line_position(self, position):
+        """设置计数线位置 (0-1 范围内的相对位置)"""
+        with QMutexLocker(self.mutex):
+            self.line_position = max(0.0, min(1.0, position))
+
+    def set_line_direction(self, direction):
+        """设置计数线方向 ('horizontal' 或 'vertical')"""
+        with QMutexLocker(self.mutex):
+            # 只有当方向确实改变时才重置计数线
+            if self.line_direction != direction:
+                self.line_direction = direction
+                self.counting_line = None  # 重置计数线，使其在下一帧重新初始化
+
+    # 修改reset_counter方法，重置所有计数器
+    def reset_counter(self):
+        """重置计数器"""
+        with QMutexLocker(self.mutex):
+            self.counter = 0
+            self.left_to_right_counter = 0
+            self.right_to_left_counter = 0
+            self.top_to_bottom_counter = 0
+            self.bottom_to_top_counter = 0
+            self.crossed_ids = set()
+            self.crossed_direction = {}
 
     def set_source(self, source_type, file_path=None):
         with QMutexLocker(self.mutex):
@@ -89,7 +145,9 @@ class DetectionWorker(QObject):
                     if cap is None:
                         cap = cv2.VideoCapture(0)
                         if not cap.isOpened():
-                            self.error_occurred.emit("无法打开摄像头")
+                            error_msg = "无法打开摄像头"
+                            logger.error(error_msg)  # 记录到日志
+                            self.error_occurred.emit(error_msg)
                             continue
                     while self.currently_processing and self.running:
                         with QMutexLocker(self.mutex):
@@ -109,7 +167,9 @@ class DetectionWorker(QObject):
                     if cap is None:
                         cap = cv2.VideoCapture(self.file_path)
                         if not cap.isOpened():
-                            self.error_occurred.emit("无法打开视频文件")
+                            error_msg = "无法打开视频文件"
+                            logger.error(error_msg)  # 记录到日志
+                            self.error_occurred.emit(error_msg)
                             continue
                     while self.currently_processing and self.running:
                         with QMutexLocker(self.mutex):
@@ -133,7 +193,9 @@ class DetectionWorker(QObject):
                         self.process_frame(frame)
                         self.status_changed.emit("图片检测完成")
             except Exception as e:
-                self.error_occurred.emit(f"处理错误: {str(e)}")
+                error_msg = f"处理错误: {str(e)}"
+                logger.exception(error_msg)  # 记录详细的异常信息到日志
+                self.error_occurred.emit(error_msg)
             finally:
                 self.currently_processing = False
         if cap is not None:
@@ -151,9 +213,77 @@ class DetectionWorker(QObject):
             )
         return self.id_colors[track_id]
 
+    # 修改check_line_crossing方法，添加方向检测
+    def check_line_crossing(self, track):
+        """检查轨迹是否穿过计数线，并判断穿过方向"""
+        # 如果计数线未初始化，直接返回False
+        if self.counting_line is None:
+            return False
+            
+        if track['id'] in self.crossed_ids:
+            return False
+            
+        trace = track['trace']
+        if len(trace) < 2:
+            return False
+            
+        # 获取最近的两个点
+        p1 = trace[-2]
+        p2 = trace[-1]
+        
+        try:
+            if self.line_direction == 'horizontal':
+                # 水平线，检查是否从上到下或从下到上穿过
+                line_y = self.counting_line[0][1]  # 线的y坐标
+                if p1[1] < line_y and p2[1] >= line_y:
+                    # 从上到下穿过
+                    self.crossed_ids.add(track['id'])
+                    self.crossed_direction[track['id']] = 'top_to_bottom'
+                    self.top_to_bottom_counter += 1
+                    return True
+                elif p1[1] >= line_y and p2[1] < line_y:
+                    # 从下到上穿过
+                    self.crossed_ids.add(track['id'])
+                    self.crossed_direction[track['id']] = 'bottom_to_top'
+                    self.bottom_to_top_counter += 1
+                    return True
+            else:  # vertical
+                # 垂直线，检查是否从左到右或从右到左穿过
+                line_x = self.counting_line[0][0]  # 线的x坐标
+                if p1[0] < line_x and p2[0] >= line_x:
+                    # 从左到右穿过
+                    self.crossed_ids.add(track['id'])
+                    self.crossed_direction[track['id']] = 'left_to_right'
+                    self.left_to_right_counter += 1
+                    return True
+                elif p1[0] >= line_x and p2[0] < line_x:
+                    # 从右到左穿过
+                    self.crossed_ids.add(track['id'])
+                    self.crossed_direction[track['id']] = 'right_to_left'
+                    self.right_to_left_counter += 1
+                    return True
+        except Exception as e:
+            logger.error(f"计数线检测错误: {str(e)}")  # 记录到日志而不是显示在画面上
+            # 不抛出异常，继续执行
+                
+        return False
+
+    # 修改DetectionWorker类中的方法
+    
     def process_frame(self, frame):
         if self.paused:
             return
+            
+        # 初始化计数线（如果尚未初始化）
+        if self.counting_line is None:
+            h, w = frame.shape[:2]
+            if self.line_direction == 'horizontal':
+                y = int(h * self.line_position)
+                self.counting_line = [(0, y), (w, y)]
+            else:  # vertical
+                x = int(w * self.line_position)
+                self.counting_line = [(x, 0), (x, h)]
+                
         # Use YOLO model for detection
         results = self.model.predict(frame, conf=0.5, iou=0.7)
         boxes = results[0].boxes
@@ -168,6 +298,14 @@ class DetectionWorker(QObject):
                 dets.append([x1, y1, x2, y2, conf, cls])
         # 更新tracker
         tracks = self.tracker.update(dets, frame_shape=frame.shape)
+        
+        # 检查是否有物体穿过计数线
+        for track in tracks:
+            # 添加ID到总ID集合
+            self.total_ids.add(track['id'])
+            if self.check_line_crossing(track):
+                self.counter += 1
+                
         # 绘制检测框和轨迹（每个id唯一颜色）
         annotated_frame = frame.copy()
         for i, track in enumerate(tracks):
@@ -191,6 +329,34 @@ class DetectionWorker(QObject):
                         pt1 = (int(trace[j-1][0]), int(trace[j-1][1]))
                         pt2 = (int(trace[j][0]), int(trace[j][1]))
                         cv2.line(annotated_frame, pt1, pt2, color, 2)
+                        
+        # 绘制计数线（确保计数线已初始化）
+        if self.counting_line is not None:
+            line_color = (0, 0, 255)  # 红色
+            cv2.line(annotated_frame, self.counting_line[0], self.counting_line[1], line_color, 2)
+        
+        # 显示计数和总ID数
+        count_text = f"Total Count: {self.counter}"
+        cv2.putText(annotated_frame, count_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        
+        # 显示当前检测到的总ID数
+        total_ids_text = f"Total IDs: {len(self.total_ids)}"
+        cv2.putText(annotated_frame, total_ids_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        
+        # 显示双向计数结果
+        if self.line_direction == 'horizontal':
+            # 显示从上到下和从下到上的计数
+            top_to_bottom_text = f"Top→Bottom: {self.top_to_bottom_counter}"
+            bottom_to_top_text = f"Bottom→Top: {self.bottom_to_top_counter}"
+            cv2.putText(annotated_frame, top_to_bottom_text, (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+            cv2.putText(annotated_frame, bottom_to_top_text, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+        else:  # vertical
+            # 显示从左到右和从右到左的计数
+            left_to_right_text = f"Left→Right: {self.left_to_right_counter}"
+            right_to_left_text = f"Right→Left: {self.right_to_left_counter}"
+            cv2.putText(annotated_frame, left_to_right_text, (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+            cv2.putText(annotated_frame, right_to_left_text, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+        
         # 转为RGB
         rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
         self.image_ready.emit(rgb_image)
@@ -204,7 +370,7 @@ class YOLODetectionApp(QMainWindow):
 
         # 加载YOLO模型
         self.model = YOLO(
-            r"D:\Android\pyProj\ultralytics-main\ultralytics-main\runs\fish\detect\Archie\yolo11FRFN\train2\weights\best.pt")
+            r"D:\pyProject\ultralytics_custom\runs\fish\detect\Archie\yolo11FRFN\train2\weights\best.pt")
 
         # 创建检测线程和工作器
         self.thread = QThread()
@@ -266,6 +432,33 @@ class YOLODetectionApp(QMainWindow):
         control_layout.addStretch()
         control_group.setLayout(control_layout)
 
+        # 计数线控制面板
+        line_control_group = QGroupBox("计数线控制")
+        line_control_layout = QHBoxLayout()
+
+        # 线位置滑块
+        self.line_position_slider = QSlider(Qt.Horizontal)
+        self.line_position_slider.setMinimum(0)
+        self.line_position_slider.setMaximum(100)
+        self.line_position_slider.setValue(50)  # 默认在中间
+        self.line_position_slider.valueChanged.connect(self.update_line_position)
+
+        # 线方向选择
+        self.line_direction_combo = QComboBox()
+        self.line_direction_combo.addItems(["水平线", "垂直线"])
+        self.line_direction_combo.currentIndexChanged.connect(self.update_line_direction)
+
+        # 重置计数按钮
+        self.reset_counter_btn = QPushButton("重置计数")
+        self.reset_counter_btn.clicked.connect(self.reset_counter)
+
+        line_control_layout.addWidget(QLabel("线位置:"))
+        line_control_layout.addWidget(self.line_position_slider)
+        line_control_layout.addWidget(QLabel("线方向:"))
+        line_control_layout.addWidget(self.line_direction_combo)
+        line_control_layout.addWidget(self.reset_counter_btn)
+        line_control_group.setLayout(line_control_layout)
+
         # 显示区域
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
@@ -283,10 +476,27 @@ class YOLODetectionApp(QMainWindow):
 
         # 添加到主布局
         main_layout.addWidget(control_group)
+        main_layout.addWidget(line_control_group)
         main_layout.addWidget(self.image_label)
 
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
+
+    def update_line_position(self):
+        """更新计数线位置"""
+        position = self.line_position_slider.value() / 100.0
+        self.worker.set_line_position(position)
+
+    def update_line_direction(self):
+        """更新计数线方向"""
+        direction = 'horizontal' if self.line_direction_combo.currentText() == "水平线" else 'vertical'
+        self.worker.set_line_direction(direction)
+        # 重置计数线，使其在下一帧重新初始化
+        self.worker.counting_line = None
+
+    def reset_counter(self):
+        """重置计数器"""
+        self.worker.reset_counter()
 
     def reset_ui(self):
         """当选择新的输入源时重置UI"""
@@ -351,8 +561,12 @@ class YOLODetectionApp(QMainWindow):
     @pyqtSlot(str)
     def show_error(self, message):
         """显示错误信息"""
+        # 记录到日志
+        logger.error(message)
+        # 更新状态栏而不是在画面上显示
         self.update_status(f"错误: {message}")
-        self.image_label.setText(message)
+        # 不再在图像标签上显示错误信息
+        # self.image_label.setText(message)  # 注释掉这行
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
